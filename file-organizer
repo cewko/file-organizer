@@ -1,0 +1,406 @@
+#!/usr/bin/bash
+
+# exit on error, undefined vars, and pipeline failures
+set -euo pipefail
+
+# metadata
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly VERSION="1.0.0"
+
+# color codes
+readonly RED='\033[1;31m'
+readonly GREEN='\033[1;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[1;34m'
+readonly CYAN='\033[1;36m'
+readonly NC='\033[0m'   # no color
+
+# extension mapping
+declare -rA EXTENSION_MAP=(
+    ["images"]="jpg jpeg png gif bmp svg webp tiff heic ico"
+    ["videos"]="mp4 mkv mov avi flv wmv webm mpg mpeg m4v 3gp"
+    ["audio"]="mp3 wav flac aac ogg m4a wma opus"
+    ["documents"]="pdf doc docx txt rtf odt xls xlsx ppt pptx csv md tex"
+    ["code"]="py js java cpp c cs html css php go rb swift ts sh bash zsh fish ipynb sql r scala kt"
+    ["archives"]="zip rar 7z tar gz bz2 xz iso deb rpm pkg apk"
+    ["installers"]="exe msi dmg deb rpm pkg apk flatpak snap appimage"
+    ["e-books"]="epub mobi azw3 azw fb2 lit"
+    ["config"]="ini json yaml yml log cfg toml conf xml properties"
+    ["fonts"]="ttf otf woff woff2 eot"
+    ["3d-models"]="obj stl ply dae fbx blend"
+)
+
+# default category for unknown extensions
+readonly DEFAULT_CATEGORY="misc"
+
+# global flags
+declare VERBOSE=false
+declare DRY_RUN=false
+
+# absolute path of the dir to organize
+declare -g TARGET_DIRECTORY
+
+# display usage information
+show_usage() {
+    cat << EOF
+${SCRIPT_NAME} v${VERSION}
+
+description:
+    organizes files in a directory by moving them into categorized folders
+    based on their file extensions.
+
+usage:
+    ${SCRIPT_NAME} [option] [directory]
+
+options:
+    -h, --help      show this help message
+    -v, --verbose   show detailed output
+    -n, --dry-run   show what would be done without actually moving files
+    --version       show version information
+EOF
+}
+
+# generic message printer with type and color
+print_message() {
+    local -r type="$1"
+    local -r color="$2" 
+    local -r message="$3"
+    local -r fd="${4:-1}"   # default to stdout
+    
+    printf "${color}%s: %s${NC}\n" "$type" "$message" >&"$fd"
+}
+
+# wrapper functions for different message types
+error()   { print_message "error"   "$RED"    "$1" 2; }
+success() { print_message "success" "$GREEN"  "$1"; }
+info()    { print_message "info"    "$BLUE"   "$1"; }
+warning() { print_message "warning" "$YELLOW" "$1"; }
+
+# verbose messages only when verbose mode is enabled
+verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        printf "${CYAN}verbose: %s${NC}\n" "$1"
+    fi
+}
+
+# extract file extension from filename
+extract_extension() {
+    local -r filename="$1"
+    local extension="${filename##*.}"
+    
+    if [[ "$filename" == "$extension" ]] || [[ "$filename" == .* ]]; then
+        return 0
+    fi
+    
+    echo "${extension,,}"
+}
+
+# find category for given file extension
+find_category() {
+    local -r extension="$1"
+    
+    for category in "${!EXTENSION_MAP[@]}"; do
+        if [[ " ${EXTENSION_MAP[$category]} " =~ " $extension " ]]; then
+            echo "$category"
+            return 0
+        fi
+    done
+    
+    echo "$DEFAULT_CATEGORY"
+}
+
+# create directory if doesn't exist
+ensure_directory() {
+    local -r dir="$1"
+    
+    [[ -d "$dir" ]] && return 0
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[DRY RUN] would create directory: $dir"
+        return 0
+    fi
+    
+    if mkdir -p "$dir"; then
+        verbose "created directory: $dir"
+    else
+        error "failed to create directory: $dir"
+        return 1
+    fi
+}
+
+# move file to target directory
+categorize() {
+    local -r source="$1"
+    local -r target_dir="$2"
+    local -r filename="$(basename "$source")"
+    local -r target="$target_dir/$filename"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[DRY_RUN] would move: $source -> $target"
+        return 0
+    fi
+    
+    if mv "$source" "$target"; then
+        success "moved: $filename -> $target_dir/"
+        return 0
+    else
+        error "failed to move: $source -> $target"
+        return 1
+    fi
+}
+
+# get array of files in directory
+get_files_in_directory() {
+    local -r target_dir="$1"
+    local -n files_ref="$2"
+
+    files_ref=()
+
+    while IFS= read -r -d '' file; do
+        files_ref+=("$file")
+    done < <(find "$target_dir" -maxdepth 1 -type f -print0)
+}
+
+# check if file exist and is a regular file
+is_regular_file() {
+    local -r file="$1"
+
+    if [[ ! -f "$file" ]]; then
+        verbose "file '$file' no longer exists, skipping"
+        return 1
+    fi
+
+    return 0
+}
+
+# extract filename and extension from the path
+extract_file_info() {
+    local -r file="$1"
+    local -n filename_ref="$2"
+    local -n extension_ref="$3"
+    
+    filename_ref="$(basename "$file")"
+    verbose "got filename: '$filename_ref'"
+    
+    extension_ref="$(extract_extension "$filename_ref")"
+    verbose "got extension: '${extension_ref:-none}'"
+}
+
+# check if file has extension
+has_extension() {
+    local -r filename="$1"
+    local -r extension="$2"
+    
+    verbose "filename: '$filename' (extension: '${extension:-none}')"
+    
+    if [[ -z "$extension" ]]; then
+        verbose "skipping file without extension: $filename"
+        return 1
+    fi
+    
+    return 0
+}
+
+# get category directory path
+get_category_directory() {
+    local -r extension="$1"
+    local -r target_dir="$2"
+    local -n category_dir_ref="$3"
+    
+    verbose "finding category for extension: '$extension'"
+    local category
+    category="$(find_category "$extension")"
+    category_dir_ref="$target_dir/$category"
+    
+    verbose "file category: '$category' -> '$category_dir_ref'"
+}
+
+# process file for organization
+process() {
+    local -r file="$1"
+    local -r target_dir="$2"
+    
+    verbose "file to process: '$file'"
+
+    # check if file exists
+    is_regular_file "$file" || return 1
+    verbose "file exists, getting basename"
+
+    # get file info
+    local filename extension
+    extract_file_info "$file" filename extension
+    
+    # check if should be processed
+    has_extension "$filename" "$extension" || return 1
+
+    # get directory path
+    local category_dir
+    get_category_directory "$extension" "$target_dir" category_dir
+    
+    # ensure category directory exists
+    verbose "ensuring directory exists: '$category_dir'"
+    ensure_directory "$category_dir" || return 1
+    
+    verbose "moving file to category directory"
+    categorize "$file" "$category_dir"
+}
+
+# core directory organization logic
+organize_directory() {
+    local -r target_dir="$1"
+    local file_count=0 moved_count=0
+    
+    info "organizing directory: $target_dir"
+    verbose "searching for files in: $target_dir"
+    
+    local -a files
+    get_files_in_directory "$target_dir" files
+    
+    local -r total_files="${#files[@]}"
+    verbose "total files found: $total_files"
+    verbose "about to start processing loop"
+    
+    # process each file
+    for file in "${files[@]}"; do
+        verbose "loop iteration started"
+        file_count=$((file_count + 1))
+        verbose "processing file #$file_count"
+        verbose "file path: $file"
+        
+        if process "$file" "$target_dir"; then
+            moved_count=$((moved_count + 1))
+            verbose "successfully processed file"
+        else
+            verbose "skipped or failed to process file"
+        fi
+    done
+    
+    verbose "finished processing all files"
+    
+    display_summary "$file_count" "$moved_count" "$target_dir"
+}
+
+# display processing summary
+display_summary() {
+    local -r file_count="$1"
+    local -r moved_count="$2"
+    local -r target_dir="$3"
+    
+    if [[ $file_count -eq 0 ]]; then
+        warning "no files were found to organize"
+        info "this could mean: "
+        info "  - the directory is empty"
+        info "  - all files are hidden (start with .)"
+        info "  - all files lack extensions"
+        info "  - permission issues"
+    fi
+    
+    info "processing complete:"
+    info "files found: $file_count"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        info "files that would be moved: $moved_count"
+        info "files that would be skipped: $((file_count - moved_count))"
+    else
+        info "files moved: $moved_count"
+        info "files skipped: $((file_count - moved_count))"
+    fi
+}
+
+# validate and resolve directory path
+validate_directory() {
+    local dir="$1"
+    
+    # resolve to absolute path if possible
+    if command -v realpath >/dev/null 2>&1; then
+        dir="$(realpath "$dir" 2>/dev/null || echo "$dir")"
+    fi
+    
+    # validation checks
+    if [[ ! -e "$dir" ]]; then
+        error "path doesn't exist: $dir"
+        return 1
+    fi
+    
+    if [[ ! -d "$dir" ]]; then
+        error "path is not a directory: $dir"
+        return 1
+    fi
+    
+    if [[ ! -w "$dir" ]]; then
+        error "directory is not writable: $dir"
+        return 1
+    fi
+    
+    echo "$dir"
+}
+
+# parse command line arguments
+parse_arguments() {
+    local target_directory_arg=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --version)
+                echo "${SCRIPT_NAME} v${VERSION}"
+                exit 0
+                ;;
+            -*)
+                error "unknown option: $1"
+                show_usage >&2
+                exit 1
+                ;;
+            *)
+                if [[ -n "$target_directory_arg" ]]; then
+                    error "multiple directory arguments provided"
+                    show_usage >&2
+                    exit 1
+                fi
+                target_directory_arg="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # set target directory
+    if [[ -n "$target_directory_arg" ]]; then
+        TARGET_DIRECTORY="$(validate_directory "$target_directory_arg")" || exit 1
+    else
+        TARGET_DIRECTORY="$PWD"
+    fi
+}
+
+# handle script interruption
+cleanup() {
+    echo
+    warning "script interrupted by user"
+    exit 130
+}
+
+main() {
+    trap cleanup INT TERM
+    parse_arguments "$@"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        warning "DRY RUN: no files will be moved"
+    fi
+    
+    organize_directory "$TARGET_DIRECTORY"
+}
+
+# execute main function only if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
